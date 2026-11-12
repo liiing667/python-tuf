@@ -210,7 +210,7 @@ class Updater:
             ``TargetFile`` instance or ``None``.
         """
 
-        if Targets.type not in self._trusted_set:
+        if not self._trusted_set.contains(Targets.type, Root.type):
             self.refresh()
         return self._preorder_depth_first_walk(target_path)
 
@@ -469,9 +469,11 @@ class Updater:
     def _load_targets(self, role: str, parent_role: str) -> Targets:
         """Load local (and if needed remote) metadata for ``role``."""
 
-        # Avoid loading 'role' more than once for the same parent_role
+        # Avoid loading 'role' more than once for the same parent_role:
+        # the same role name under a different parent_role is a different
+        # delegation and must be loaded (and verified) separately
         if self._trusted_set.contains(role, parent_role):
-            return cast("Targets", self._trusted_set[role])
+            return cast("Targets", self._trusted_set[parent_role, role])
 
         try:
             data = self._load_local_metadata(role)
@@ -488,7 +490,8 @@ class Updater:
             metainfo = snapshot.meta.get(f"{role}.json")
             if metainfo is None:
                 raise exceptions.RepositoryError(
-                    f"Role {role} was delegated but is not part of snapshot"
+                    f"Role {parent_role}/{role} was delegated "
+                    "but is not part of snapshot"
                 ) from None
 
             length = metainfo.length or self.config.targets_max_length
@@ -516,19 +519,25 @@ class Updater:
         # List of delegations to be interrogated. A (role, parent role) pair
         # is needed to load and verify the delegated targets metadata.
         delegations_to_visit = [(Targets.type, Root.type)]
-        visited_role_names: set[str] = set()
+        # A (parent role, role) pair identifies a delegation: the same role
+        # name delegated by different parents is visited once per parent
+        visited_roles: set[tuple[str, str]] = set()
 
         # Preorder depth-first traversal of the graph of target delegations.
         while (
-            len(visited_role_names) <= self.config.max_delegations
+            len(visited_roles) <= self.config.max_delegations
             and len(delegations_to_visit) > 0
         ):
             # Pop the role name from the top of the stack.
             role_name, parent_role = delegations_to_visit.pop(-1)
 
             # Skip any visited current role to prevent cycles.
-            if role_name in visited_role_names:
-                logger.debug("Skipping visited current role %s", role_name)
+            if (parent_role, role_name) in visited_roles:
+                logger.debug(
+                    "Skipping visited current role %s/%s",
+                    parent_role,
+                    role_name,
+                )
                 continue
 
             # The metadata for 'role_name' must be downloaded/updated before
@@ -542,7 +551,7 @@ class Updater:
                 return target
 
             # After preorder check, add current role to set of visited roles.
-            visited_role_names.add(role_name)
+            visited_roles.add((parent_role, role_name))
 
             if targets.delegations is not None:
                 child_roles_to_visit = []

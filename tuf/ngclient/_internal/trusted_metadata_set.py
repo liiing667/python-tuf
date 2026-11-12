@@ -9,9 +9,11 @@ https://theupdateframework.github.io/specification/latest#detailed-client-workfl
 in the TUF specification: the remaining steps are related to filesystem and
 network IO, which are not handled here.
 
-Loaded metadata can be accessed via index access with rolename as key
-(``trusted_set[Root.type]``) or, in the case of top-level metadata, using the
-helper properties (``trusted_set.root``).
+Loaded metadata is identified by a (delegator, role) pair: the same delegated
+role name may be delegated by multiple delegators with different contents, so
+metadata can be accessed via index access with a (delegator, role) tuple as
+key (``trusted_set[Root.type, Targets.type]``) or, in the case of top-level
+metadata, using the helper properties (``trusted_set.root``).
 
 Signatures are verified and discarded upon inclusion into the trusted set.
 
@@ -114,8 +116,7 @@ class TrustedMetadataSet(abc.Mapping):
             RepositoryError: Metadata failed to load or verify. The actual
                 error type and content will contain more details.
         """
-        self._trusted_set: dict[str, Signed] = {}
-        self._trusted_delegations: set[tuple[str, str]] = set()
+        self._trusted_set: dict[tuple[str, str], Signed] = {}
         self.reference_time = datetime.now(UTC)
 
         if envelope_type is EnvelopeType.SIMPLE:
@@ -132,15 +133,14 @@ class TrustedMetadataSet(abc.Mapping):
         """Check if ``role`` is in ``TrustedMetadataSet`` and was verified
         against ``delegator``.
         """
-        return (delegator, role) in self._trusted_delegations
+        return (delegator, role) in self._trusted_set
 
     def _add(self, role: str, signed: Signed, delegator: str) -> None:
         """Add role to trusted set, keep track of delegator(s)"""
-        self._trusted_set[role] = signed
-        self._trusted_delegations.add((delegator, role))
+        self._trusted_set[(delegator, role)] = signed
 
-    def __getitem__(self, role: str) -> Signed:
-        """Return current ``Signed`` for ``role``."""
+    def __getitem__(self, role: tuple[str, str]) -> Signed:
+        """Return current ``Signed`` for a (delegator, role) pair."""
         return self._trusted_set[role]
 
     def __len__(self) -> int:
@@ -157,22 +157,22 @@ class TrustedMetadataSet(abc.Mapping):
     @property
     def root(self) -> Root:
         """Get current root."""
-        return cast("Root", self._trusted_set[Root.type])
+        return cast("Root", self._trusted_set[Root.type, Root.type])
 
     @property
     def timestamp(self) -> Timestamp:
         """Get current timestamp."""
-        return cast("Timestamp", self._trusted_set[Timestamp.type])
+        return cast("Timestamp", self._trusted_set[Root.type, Timestamp.type])
 
     @property
     def snapshot(self) -> Snapshot:
         """Get current snapshot."""
-        return cast("Snapshot", self._trusted_set[Snapshot.type])
+        return cast("Snapshot", self._trusted_set[Root.type, Snapshot.type])
 
     @property
     def targets(self) -> Targets:
         """Get current top-level targets."""
-        return cast("Targets", self._trusted_set[Targets.type])
+        return cast("Targets", self._trusted_set[Root.type, Targets.type])
 
     # Methods for updating metadata
     def update_root(self, data: bytes) -> Root:
@@ -192,7 +192,7 @@ class TrustedMetadataSet(abc.Mapping):
         Returns:
             Deserialized and verified ``Root`` object
         """
-        if Timestamp.type in self._trusted_set:
+        if (Root.type, Timestamp.type) in self._trusted_set:
             raise RuntimeError("Cannot update root after timestamp")
         logger.debug("Updating root")
 
@@ -235,7 +235,7 @@ class TrustedMetadataSet(abc.Mapping):
         Returns:
             Deserialized and verified ``Timestamp`` object
         """
-        if Snapshot.type in self._trusted_set:
+        if (Root.type, Snapshot.type) in self._trusted_set:
             raise RuntimeError("Cannot update timestamp after snapshot")
 
         # client workflow 5.3.10: Make sure final root is not expired.
@@ -248,7 +248,7 @@ class TrustedMetadataSet(abc.Mapping):
 
         # If an existing trusted timestamp is updated,
         # check for a rollback attack
-        if Timestamp.type in self._trusted_set:
+        if (Root.type, Timestamp.type) in self._trusted_set:
             # Prevent rolling back timestamp version
             if new_timestamp.version < self.timestamp.version:
                 raise exceptions.BadVersionNumberError(
@@ -316,9 +316,9 @@ class TrustedMetadataSet(abc.Mapping):
             Deserialized and verified ``Snapshot`` object
         """
 
-        if Timestamp.type not in self._trusted_set:
+        if (Root.type, Timestamp.type) not in self._trusted_set:
             raise RuntimeError("Cannot update snapshot before timestamp")
-        if Targets.type in self._trusted_set:
+        if (Root.type, Targets.type) in self._trusted_set:
             raise RuntimeError("Cannot update snapshot after targets")
         logger.debug("Updating snapshot")
 
@@ -338,7 +338,7 @@ class TrustedMetadataSet(abc.Mapping):
         # used in rollback protection: it is checked when targets is updated
 
         # If an existing trusted snapshot is updated, check for rollback attack
-        if Snapshot.type in self._trusted_set:
+        if (Root.type, Snapshot.type) in self._trusted_set:
             for filename, fileinfo in self.snapshot.meta.items():
                 new_fileinfo = new_snapshot.meta.get(filename)
 
@@ -411,16 +411,18 @@ class TrustedMetadataSet(abc.Mapping):
         Returns:
             Deserialized and verified ``Targets`` object
         """
-        if Snapshot.type not in self._trusted_set:
+        if (Root.type, Snapshot.type) not in self._trusted_set:
             raise RuntimeError("Cannot load targets before snapshot")
 
         # Targets cannot be loaded if final snapshot is expired or its version
         # does not match meta version in timestamp
         self._check_final_snapshot()
 
-        delegator: Delegator | None = self.get(delegator_name)
+        delegator = self._get_delegator(delegator_name)
         if delegator is None:
-            raise RuntimeError("Cannot load targets before delegator")
+            raise RuntimeError(
+                f"Cannot load {role_name} before delegator {delegator_name}"
+            )
 
         logger.debug("Updating %s delegated by %s", role_name, delegator_name)
 
@@ -428,7 +430,8 @@ class TrustedMetadataSet(abc.Mapping):
         meta = self.snapshot.meta.get(f"{role_name}.json")
         if meta is None:
             raise exceptions.RepositoryError(
-                f"Snapshot does not contain information for '{role_name}'"
+                f"Snapshot does not contain information for "
+                f"'{delegator_name}/{role_name}'"
             )
 
         meta.verify_length_and_hashes(data)
@@ -440,16 +443,32 @@ class TrustedMetadataSet(abc.Mapping):
         version = new_delegate.version
         if version != meta.version:
             raise exceptions.BadVersionNumberError(
-                f"Expected {role_name} v{meta.version}, got v{version}."
+                f"Expected {delegator_name}/{role_name} "
+                f"v{meta.version}, got v{version}."
             )
 
         if new_delegate.is_expired(self.reference_time):
-            raise exceptions.ExpiredMetadataError(f"New {role_name} is expired")
+            raise exceptions.ExpiredMetadataError(
+                f"New {delegator_name}/{role_name} is expired"
+            )
 
         self._add(role_name, new_delegate, delegator_name)
         logger.debug("Updated %s v%d", role_name, version)
 
         return new_delegate
+
+    def _get_delegator(self, delegator_name: str) -> Delegator | None:
+        """Return trusted metadata for ``delegator_name``.
+
+        The same role name can be delegated by multiple delegators: return
+        the most recently added metadata with a matching role name, as that
+        is the delegator in the currently traversed delegation path.
+        """
+        for delegator, role in reversed(self._trusted_set):
+            if role == delegator_name:
+                return cast("Delegator", self._trusted_set[delegator, role])
+
+        return None
 
     def _load_trusted_root(self, data: bytes) -> None:
         """Verify and load ``data`` as trusted root metadata.

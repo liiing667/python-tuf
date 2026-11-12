@@ -370,6 +370,69 @@ class TestDelegationsGraphs(TestDelegations):
         with self.assertRaises(UnsignedMetadataError):
             updater.get_targetinfo("path-b")
 
+    def test_shared_role_name_key_rotation(self) -> None:
+        """Test same role name delegated by different parents with different
+        keys and contents: both parent->role paths must be traversable.
+
+        Repo v1: targets -> parent-a -> release (key K1, contains file-a).
+        Repo v2: release keys are rotated, parent-b -> release (key K2,
+        contains file-b). The client already has release v1 in local cache
+        (offline copy) and refreshes top-level metadata from repo v2.
+        """
+        test_case = DelegationsTestCase(
+            delegations=[
+                TestDelegation("targets", "parent-a"),
+                TestDelegation("parent-a", "release"),
+            ],
+            target_files=[TestTarget("release", b"content-a", "file-a")],
+        )
+        self._init_repo(test_case)
+
+        # Client refreshes and caches release v1 (signed by K1)
+        updater = self._init_updater()
+        self.assertIsNotNone(updater.get_targetinfo("file-a"))
+
+        # Rotate release keys and change its contents: parent-b delegates to
+        # release with a new key K2, release now contains file-b instead of
+        # file-a. The repository does not pin hashes in snapshot so the
+        # version can stay the same.
+        release = self.sim.md_delegates["release"].signed
+        del release.targets["file-a"]
+        self.sim.add_target("release", b"content-b", "file-b")
+        self.sim.signers["release"].clear()
+        spec_version = ".".join(SPECIFICATION_VERSION)
+        parent_b = Targets(1, spec_version, self.sim.safe_expiry, {}, None)
+        self.sim.add_delegation(
+            "targets", DelegatedRole("parent-b", [], 1, False, ["*"]), parent_b
+        )
+        self.sim.add_delegation(
+            "parent-b", DelegatedRole("release", [], 1, False, ["*"]), release
+        )
+        self.sim.targets.version += 1
+        self.sim.update_snapshot()
+
+        # Client refreshes top-level metadata from the updated repository
+        updater = self._init_updater()
+        updater.refresh()
+
+        # file-a is found via parent-a using the locally cached release v1
+        target_a = updater.get_targetinfo("file-a")
+        self.assertIsNotNone(target_a)
+
+        # file-b is found via parent-b: the second parent path must not be
+        # skipped even though "release" was already visited via parent-a
+        target_b = updater.get_targetinfo("file-b")
+        self.assertIsNotNone(target_b)
+
+        # Both parent->role identities are tracked in the trusted set
+        self.assertTrue(updater._trusted_set.contains("release", "parent-a"))
+        self.assertTrue(updater._trusted_set.contains("release", "parent-b"))
+
+        # The target found via the second parent downloads as expected
+        path = updater.download_target(target_b)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"content-b")
+
     def test_safely_encoded_rolenames(self) -> None:
         """Test that delegated roles names are safely encoded in the filenames
         and URLs.

@@ -97,6 +97,19 @@ class TestTrustedMetadataSet(unittest.TestCase):
             key = root.get_key(role_obj.keyids[0])
             cls.keystore[role] = Signer.from_priv_key_uri(uri, key)
 
+        # Delegated roles are all signed with the same delegation key
+        targets = (
+            Metadata[Targets].from_bytes(cls.metadata[Targets.type]).signed
+        )
+        assert targets.delegations is not None
+        assert targets.delegations.roles is not None
+        role_obj = targets.delegations.roles["role1"]
+        assert targets.delegations.keys is not None
+        key = targets.delegations.keys[role_obj.keyids[0]]
+        uri = f"file2:{os.path.join(keystore_dir, 'delegation_key')}"
+        cls.keystore["role1"] = Signer.from_priv_key_uri(uri, key)
+        cls.keystore["role2"] = cls.keystore["role1"]
+
         def hashes_length_modifier(timestamp: Timestamp) -> None:
             timestamp.snapshot_meta.hashes = None
             timestamp.snapshot_meta.length = None
@@ -164,6 +177,47 @@ class TestTrustedMetadataSet(unittest.TestCase):
 
         self.assertTrue(self.trusted_set.contains("role1", Targets.type))
         self.assertFalse(self.trusted_set.contains("role1", "other-parent"))
+
+    def test_same_rolename_different_delegators(self) -> None:
+        """Test that the same delegated role name loaded under different
+        delegators is tracked by its (delegator, role) identity."""
+
+        # Make role2 delegate to role1, reusing targets' delegation of role1
+        targets = (
+            Metadata[Targets].from_bytes(self.metadata[Targets.type]).signed
+        )
+
+        def delegate_role1(role2: Targets) -> None:
+            role2.delegations = targets.delegations
+
+        role2 = self.modify_metadata("role2", delegate_role1)
+
+        self._update_all_besides_targets()
+        self.trusted_set.update_targets(self.metadata[Targets.type])
+        self.trusted_set.update_delegated_targets(
+            self.metadata["role1"], "role1", Targets.type
+        )
+        self.trusted_set.update_delegated_targets(role2, "role2", "role1")
+
+        # Load role1 again, this time delegated by role2
+        self.trusted_set.update_delegated_targets(
+            self.metadata["role1"], "role1", "role2"
+        )
+
+        # Both parent->role identities are tracked separately
+        self.assertTrue(self.trusted_set.contains("role1", Targets.type))
+        self.assertTrue(self.trusted_set.contains("role1", "role2"))
+        self.assertIsNotNone(self.trusted_set[Targets.type, "role1"])
+        self.assertIsNotNone(self.trusted_set["role2", "role1"])
+        # 4 top-level metadata + role1 (via targets) + role2 + role1 (via
+        # role2)
+        self.assertEqual(len(self.trusted_set), 7)
+
+        # Error messages identify the delegation as parent->role
+        with self.assertRaisesRegex(exceptions.RepositoryError, "role2/norole"):
+            self.trusted_set.update_delegated_targets(
+                self.metadata["role1"], "norole", "role2"
+            )
 
     def test_update_metadata_output(self) -> None:
         timestamp = self.trusted_set.update_timestamp(
